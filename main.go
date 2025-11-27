@@ -12,7 +12,7 @@ import (
 )
 
 // Bot token va Admin ID (o'zingiznikiga almashtiring)
-var BOT_TOKEN = "8211038536:AAGdPup2tp_YzL5_v5vMMrWm5BjHbIjteTA"
+var BOT_TOKEN = "7982906158:AAGWlif2nGgc5n0PgRoeCSg1RoaeHQ5bZL0"
 var ADMIN_ID int64 = 7518992824 // O'zingizni admin ID
 
 // ---------------- STATISTIKA ----------------
