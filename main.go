@@ -12,7 +12,7 @@ import (
 )
 
 // Bot token va Admin ID (o'zingiznikiga almashtiring)
-var BOT_TOKEN = "7982906158:AAGWlif2nGgc5n0PgRoeCSg1RoaeHQ5bZL0"
+var BOT_TOKEN = "7982906158:AAHKNYvVUxn5kjUD1OCzJE3btJlVp80mMG8"
 var ADMIN_ID int64 = 7518992824 // O'zingizni admin ID
 
 // ---------------- STATISTIKA ----------------
@@ -23,12 +23,27 @@ var (
 )
 
 // ---------------- Foydalanuvchi va admin holatlari ----------------
-var adminState = make(map[int64]string)
-var adminTempID = make(map[int64]int64)
-var animeCode = make(map[int64]string)
-var animeTemp = make(map[int64][]string)
-var animeStorage = make(map[string][]string)
+var adminState = make(map[int64]string)    // admin dialog holatlari
+var adminTempID = make(map[int64]int64)    // vaqtinchalik chatID saqlash
+var animeNameTemp = make(map[int64]string) // admin: nomni vaqtincha saqlash
+var animeCodeTemp = make(map[int64]string) // admin: kodni vaqtincha saqlash
+var startUsers = make(map[int64]string)    // userID -> username
+var blockedUsers = make(map[int64]bool)
+
+// ContentItem turli kontent turlarini saqlash uchun
+type ContentItem struct {
+	Kind   string // "video", "photo", "document", "text"
+	FileID string // file id agar mavjud bo'lsa
+	Text   string // text uchun
+}
+
+// animeStorage: code -> slice of ContentItem
+var animeStorage = make(map[string][]ContentItem)
 var storageMutex sync.RWMutex
+
+// code -> name (masalan: "naruto1" -> "Naruto")
+var animeInfo = make(map[string]string)
+var infoMutex sync.RWMutex
 
 // Kanal saqlash: [ChatID]Username
 var channels = make(map[int64]string)
@@ -46,9 +61,9 @@ func main() {
 	updates := bot.GetUpdatesChan(u)
 
 	for update := range updates {
-		handleUpdate(bot, update) // ✅ goroutine kerak emas
+		// Har bir update ni alohida goroutine ichida parallel qayta ishlaymiz
+		go handleUpdate(bot, update) // 🚀 Bu o'zgarish bot tezligini oshiradi
 	}
-
 }
 
 // ---------------- UPDATE HANDLER ----------------
@@ -78,16 +93,21 @@ func handleMessage(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
 	if text == "/start" && userID != ADMIN_ID {
 		statsMutex.Lock()
 		startCount++
+		startUsers[userID] = update.Message.From.UserName
 		statsMutex.Unlock()
 
-		msg := tgbotapi.NewMessage(chatID, "👋 Assalomu alaykum!\nkinolar olish uchun shunchaki kod kiriting:")
+		msg := tgbotapi.NewMessage(chatID, "👋 Assalomu alaykum!\nAnime olish uchun kod kiriting:")
 		bot.Send(msg)
 		return
 	}
+	if blockedUsers[userID] {
+		bot.Send(tgbotapi.NewMessage(chatID, "🚫 Siz botdan bloklangansiz."))
+		return
+	}
 
-	// ------------------ KOD KIRITSA ------------------
+	// ------------------ KOD KIRITSA (FOYDALANUVCHI) ------------------
 	if userID != ADMIN_ID && text != "/start" && text != "/admin" {
-		// Majburiy obuna tekshiruvi
+		// Majburiy obuna tekshiruvi (agar kanallar bo'lsa)
 		isMember, requiredChannel := checkMembership(bot, userID)
 		if !isMember {
 			handleMembershipCheck(bot, chatID, requiredChannel)
@@ -101,23 +121,59 @@ func handleMessage(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
 		searchStats[code]++
 		statsMutex.Unlock()
 
+		// Saqlangan kontentni o'qish
 		storageMutex.RLock()
-		videos, ok := animeStorage[code]
+		items, ok := animeStorage[code]
 		storageMutex.RUnlock()
 
-		if !ok || len(videos) == 0 {
-			bot.Send(tgbotapi.NewMessage(chatID, "🔍 Bunday kod bo‘yicha kinolar topilmadi."))
+		if !ok || len(items) == 0 {
+			bot.Send(tgbotapi.NewMessage(chatID, "🔍 Bunday kod bo‘yicha kontent topilmadi."))
 			return
 		}
 
-		bot.Send(tgbotapi.NewMessage(chatID,
-			fmt.Sprintf("🔍 %d ta video topildi. Yuborish boshlandi...", len(videos))))
+		// Nomni olish
+		infoMutex.RLock()
+		name, hasName := animeInfo[code]
+		infoMutex.RUnlock()
+		if !hasName {
+			name = "No-name"
+		}
 
-		for i, vID := range videos {
-			videoMsg := tgbotapi.NewVideo(chatID, tgbotapi.FileID(vID))
-			videoMsg.Caption = fmt.Sprintf("Qism: %d/%d", i+1, len(videos))
-			bot.Send(videoMsg)
-			time.Sleep(1 * time.Second) // Video yuborish orasidagi vaqt
+		// Birinchi xabar: topildi degan xabar
+		bot.Send(tgbotapi.NewMessage(chatID,
+			fmt.Sprintf("🔍 %d ta qism topildi. Yuborish boshlandi...", len(items))))
+
+		// Har bir itemni turiga qarab yuborish
+		for i, it := range items {
+			caption := fmt.Sprintf("%s\nQism: %d/%d", name, i+1, len(items))
+
+			switch it.Kind {
+			case "video":
+				videoMsg := tgbotapi.NewVideo(chatID, tgbotapi.FileID(it.FileID))
+				videoMsg.Caption = caption
+				bot.Send(videoMsg)
+			case "photo":
+				photoMsg := tgbotapi.NewPhoto(chatID, tgbotapi.FileID(it.FileID))
+				photoMsg.Caption = caption
+				bot.Send(photoMsg)
+			case "document":
+				docMsg := tgbotapi.NewDocument(chatID, tgbotapi.FileID(it.FileID))
+				docMsg.Caption = caption
+				bot.Send(docMsg)
+			case "text":
+				// Matn bo'lsa, bitta message: nom + qism + matn
+				full := fmt.Sprintf(`%s\nQism: %d/%d
+
+%s`, name, i+1, len(items), it.Text)
+				bot.Send(tgbotapi.NewMessage(chatID, full))
+			default:
+				// Noma'lum tur bo'lsa text sifatida yuborish
+				full := fmt.Sprintf("%s\nasosiy kanal - @Manga_uzbekcha26 \n Qism: %d/%d\n\n(noma'lum kontent)", name, i+1, len(items))
+				bot.Send(tgbotapi.NewMessage(chatID, full))
+			}
+
+			// Sekinroq yuborish uchun kichik tanaffus
+			time.Sleep(800 * time.Millisecond)
 		}
 
 		bot.Send(tgbotapi.NewMessage(chatID, "✅ Barcha qismlar yuborildi!"))
@@ -135,12 +191,21 @@ func adminMenu() tgbotapi.InlineKeyboardMarkup {
 	return tgbotapi.NewInlineKeyboardMarkup(
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("📊 Statistika", "show_stats"),
-		), tgbotapi.NewInlineKeyboardRow(
+		),
+		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("🖋 kinolar joylash", "upload_anime"),
+			tgbotapi.NewInlineKeyboardButtonData("🗑 kinolar o‘chirish", "delete_anime"),
 		),
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("➕ Kanal qo‘shish", "add_channel"),
 			tgbotapi.NewInlineKeyboardButtonData("🗑 Kanal o‘chirish", "remove_channel"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("🚫 Foydalanuvchini bloklash", "block_user"),
+			tgbotapi.NewInlineKeyboardButtonData("♻️ Blokdan chiqarish", "unblock_user"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("📵 Bloklanganlar ro‘yxati", "blocked_list"),
 		),
 	)
 }
@@ -198,6 +263,32 @@ func handleCallback(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
 	bot.Send(tgbotapi.NewCallback(update.CallbackQuery.ID, "Tekshirilmoqda..."))
 
 	switch data {
+	case "delete_anime":
+		adminState[userID] = "delete_anime_code"
+		bot.Send(tgbotapi.NewMessage(chatID, "🆔 O‘chirmoqchi bo‘lgan kinolar kodini kiriting:"))
+
+	case "block_user":
+		adminState[userID] = "block_user"
+		bot.Send(tgbotapi.NewMessage(chatID, "🚫 Bloklamoqchi bo‘lgan foydalanuvchi ID sini kiriting:"))
+
+	case "unblock_user":
+		adminState[userID] = "unblock_user"
+		bot.Send(tgbotapi.NewMessage(chatID, "♻️ Blokdan chiqariladigan user ID ni kiriting:"))
+
+	case "blocked_list":
+		if len(blockedUsers) == 0 {
+			bot.Send(tgbotapi.NewMessage(chatID, "📵 Bloklanganlar yo‘q."))
+			return
+		}
+
+		txt := "📵 *Bloklangan foydalanuvchilar:*\n\n"
+		for id := range blockedUsers {
+			txt += fmt.Sprintf("🚫 %d\n", id)
+		}
+
+		msg := tgbotapi.NewMessage(chatID, txt)
+		msg.ParseMode = "Markdown"
+		bot.Send(msg)
 
 	case "show_stats":
 		storageMutex.RLock()
@@ -241,8 +332,9 @@ func handleCallback(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
 		bot.Send(tgbotapi.NewMessage(chatID, "O‘chirmoqchi bo‘lgan kanalning CHAT ID sini kiriting:"))
 
 	case "upload_anime":
-		adminState[userID] = "anime_code"
-		bot.Send(tgbotapi.NewMessage(chatID, "🆔 kinolar kodini kiriting (masalan: 1 ):"))
+		// Boshlash: avval nom so'raladi
+		adminState[userID] = "anime_name"
+		bot.Send(tgbotapi.NewMessage(chatID, "📝 kinolar nomini kiriting :"))
 
 	case "check_membership":
 		isMember, requiredChannel := checkMembership(bot, userID)
@@ -274,6 +366,51 @@ func handleAdminText(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
 	text := update.Message.Text
 
 	switch adminState[userID] {
+	case "delete_anime_code":
+		code := strings.ToLower(strings.TrimSpace(text))
+
+		infoMutex.RLock()
+		_, exists := animeInfo[code]
+		infoMutex.RUnlock()
+
+		if !exists {
+			bot.Send(tgbotapi.NewMessage(chatID, "❌ Bu kod bo‘yicha kinolar topilmadi."))
+			delete(adminState, userID)
+			return
+		}
+
+		// 🔥 O‘chiramiz
+		infoMutex.Lock()
+		delete(animeInfo, code)
+		infoMutex.Unlock()
+
+		storageMutex.Lock()
+		delete(animeStorage, code)
+		storageMutex.Unlock()
+
+		bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("🗑 '%s' kodi bo‘yicha kinolar o‘chirildi!", strings.ToUpper(code))))
+		delete(adminState, userID)
+		return
+
+	case "block_user":
+		id, err := strconv.ParseInt(text, 10, 64)
+		if err != nil {
+			bot.Send(tgbotapi.NewMessage(chatID, "❌ Xato ID. Raqam kiriting."))
+			return
+		}
+		blockedUsers[id] = true
+		bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("🚫 %d bloklandi!", id)))
+		delete(adminState, userID)
+
+	case "unblock_user":
+		id, err := strconv.ParseInt(text, 10, 64)
+		if err != nil {
+			bot.Send(tgbotapi.NewMessage(chatID, "❌ Xato ID. Raqam kiriting."))
+			return
+		}
+		delete(blockedUsers, id)
+		bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("♻️ %d blokdan chiqarildi!", id)))
+		delete(adminState, userID)
 
 	case "add_channel_chatid":
 		id, err := strconv.ParseInt(text, 10, 64)
@@ -307,35 +444,120 @@ func handleAdminText(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
 		}
 		delete(adminState, userID)
 
-	case "anime_code":
-		code := strings.ToLower(strings.TrimSpace(text))
-		animeCode[userID] = code
-		adminState[userID] = "anime_videos"
-		animeTemp[userID] = nil
-		bot.Send(tgbotapi.NewMessage(chatID, "🎬 Videolarni yuboring. Tugagach /TUGADI deb yozing."))
-
-	case "anime_videos":
-		if text == "/TUGADI" {
-			code := animeCode[userID]
-			if len(animeTemp[userID]) == 0 {
-				bot.Send(tgbotapi.NewMessage(chatID, "❌ Video yuborilmadi. Jarayon bekor qilindi."))
-			} else {
-				storageMutex.Lock()
-				animeStorage[code] = animeTemp[userID]
-				storageMutex.Unlock()
-				bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ kinolar '%s' %d qism bilan saqlandi!", strings.ToUpper(code), len(animeTemp[userID]))))
-			}
-			delete(adminState, userID)
-			delete(animeTemp, userID)
-			delete(animeCode, userID)
+	// ------------------ ADMIN: anime nomi so'rov ------------------
+	case "anime_name":
+		name := strings.TrimSpace(text)
+		if name == "" {
+			bot.Send(tgbotapi.NewMessage(chatID, "❌ Nomi bo'sh bo'lishi mumkin emas. Iltimos nom kiriting:"))
 			return
 		}
-		if update.Message.Video != nil {
-			fileID := update.Message.Video.FileID
-			animeTemp[userID] = append(animeTemp[userID], fileID)
-			bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("📥 Video qabul qilindi! Jami: %d ta. Yana yuboring yoki /TUGADI deb yozing.", len(animeTemp[userID]))))
-		} else {
-			bot.Send(tgbotapi.NewMessage(chatID, "⚠️ Faqat video yuborishingiz yoki /TUGADI deb yozishingiz mumkin."))
+		animeNameTemp[userID] = name
+		adminState[userID] = "anime_code"
+		bot.Send(tgbotapi.NewMessage(chatID, "🆔 Endi kinolar kodi kiriting :"))
+
+	// ------------------ ADMIN: anime kodi so'rov ------------------
+	case "anime_code":
+		code := strings.ToLower(strings.TrimSpace(text))
+
+		// ❗ 1) Bo'sh kod tekshiruvi
+		if code == "" {
+			bot.Send(tgbotapi.NewMessage(chatID, "❌ Kod bo'sh bo'lishi mumkin emas. Iltimos kod kiriting:"))
+			return
 		}
+
+		// ❗ 2) Kod allaqachon mavjudligini tekshiramiz
+		infoMutex.RLock()
+		_, exists := animeInfo[code]
+		infoMutex.RUnlock()
+
+		if exists {
+			bot.Send(tgbotapi.NewMessage(chatID, "⚠️ Bu kod allaqachon mavjud! Boshqa kod kiriting:"))
+			return
+		}
+
+		// ❗ 3) Kodni saqlaymiz (code -> anime name)
+		infoMutex.Lock()
+		animeInfo[code] = animeNameTemp[userID]
+		infoMutex.Unlock()
+
+		// ❗ Bo'sh storage slot yaratamiz
+		storageMutex.Lock()
+		animeStorage[code] = nil
+		storageMutex.Unlock()
+
+		// ❗ Admin kiritgan kodni vaqtincha saqlaymiz
+		animeCodeTemp[userID] = code
+
+		// ❗ Admin endi kontent yuborishi kerak
+		adminState[userID] = "anime_videos"
+
+		bot.Send(tgbotapi.NewMessage(
+			chatID,
+			fmt.Sprintf("🎞 Endi '%s' uchun videolar/rasmlar/fayllar yoki matnlarni yuboring. Tugagach /ok deb yozing.",
+				animeNameTemp[userID]),
+		))
+		return
+
+	// ------------------ ADMIN: kontent qabul qilish ------------------
+	case "anime_videos":
+		code := animeCodeTemp[userID]
+
+		// Agar admin /TUGADI deb yuborsa yakunlaymiz
+		if strings.ToLower(text) == "/ok" {
+			storageMutex.RLock()
+			count := len(animeStorage[code])
+			storageMutex.RUnlock()
+
+			bot.Send(tgbotapi.NewMessage(chatID,
+				fmt.Sprintf("✅ '%s' uchun barcha kontent saqlandi! Jami: %d ta", animeNameTemp[userID], count)))
+
+			// Tozalash
+			delete(adminState, userID)
+			delete(animeCodeTemp, userID)
+			delete(animeNameTemp, userID)
+			return
+		}
+
+		storageMutex.Lock() // ⬅️ Hamma append va count shu yerda mutex ichida
+		defer storageMutex.Unlock()
+
+		if update.Message.Video != nil {
+			animeStorage[code] = append(animeStorage[code], ContentItem{
+				Kind:   "video",
+				FileID: update.Message.Video.FileID,
+			})
+			bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("🎬 Video qabul qilindi. Jami: %d ta", len(animeStorage[code]))))
+			return
+		}
+
+		if update.Message.Photo != nil {
+			photo := update.Message.Photo[len(update.Message.Photo)-1].FileID
+			animeStorage[code] = append(animeStorage[code], ContentItem{
+				Kind:   "photo",
+				FileID: photo,
+			})
+			bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("🖼 Rasm qabul qilindi. Jami: %d ta", len(animeStorage[code]))))
+			return
+		}
+
+		if update.Message.Document != nil {
+			animeStorage[code] = append(animeStorage[code], ContentItem{
+				Kind:   "document",
+				FileID: update.Message.Document.FileID,
+			})
+			bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("📁 Fayl qabul qilindi. Jami: %d ta", len(animeStorage[code]))))
+			return
+		}
+
+		if update.Message.Text != "" {
+			animeStorage[code] = append(animeStorage[code], ContentItem{
+				Kind: "text",
+				Text: update.Message.Text,
+			})
+			bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("✏️ Matn qabul qilindi. Jami: %d ta", len(animeStorage[code]))))
+			return
+		}
+
+		bot.Send(tgbotapi.NewMessage(chatID, "❌ Noma’lum format! Video, rasm, fayl yoki matn yuboring."))
 	}
 }
